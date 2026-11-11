@@ -30,6 +30,7 @@ jobs:
           mkdir -p www
           cp index.html www/index.html
           cp manifest.json www/manifest.json
+          cp logo.png www/logo.png
           npm init -y
           npm install --no-audit --no-fund @capacitor/core@6.2.1 @capacitor/android@6.2.1
           npm install --save-dev @capacitor/cli@6.2.1
@@ -43,6 +44,49 @@ jobs:
 
       - name: Add Android
         run: npx cap add android
+
+      - name: Generate app icons
+        run: |
+          python3 -m pip install pillow
+          python3 - <<'PY'
+          from PIL import Image
+          import os
+
+          logo = Image.open("logo.png").convert("RGBA")
+
+          def make_icon(size, safe_size, path, background=None):
+              canvas = Image.new("RGBA", (size, size), background or (0, 0, 0, 0))
+              image = logo.copy()
+              image.thumbnail((safe_size, safe_size), Image.Resampling.LANCZOS)
+              x = (size - image.width) // 2
+              y = (size - image.height) // 2
+              canvas.alpha_composite(image, (x, y))
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              canvas.save(path)
+
+          densities = {
+              "mdpi": 1,
+              "hdpi": 1.5,
+              "xhdpi": 2,
+              "xxhdpi": 3,
+              "xxxhdpi": 4
+          }
+
+          for density, scale in densities.items():
+              folder = f"android/app/src/main/res/mipmap-{density}"
+              os.makedirs(folder, exist_ok=True)
+
+              legacy = round(48 * scale)
+              make_icon(legacy, round(40 * scale),
+                        f"{folder}/ic_launcher.png", (255,255,255,255))
+              make_icon(legacy, round(40 * scale),
+                        f"{folder}/ic_launcher_round.png", (255,255,255,255))
+
+              adaptive = round(108 * scale)
+              make_icon(adaptive, round(66 * scale),
+                        f"{folder}/ic_launcher_foreground.png")
+
+          PY
 
       - name: Sync Android
         run: npx cap sync android
