@@ -1,4 +1,3 @@
-
 name: Build DEO Music APK
 
 on:
@@ -44,6 +43,858 @@ jobs:
 
       - name: Add Android
         run: npx cap add android
+
+      - name: Add native Android code (media service, Bluetooth, audio output)
+        run: |
+          set -e
+          PKG=android/app/src/main/java/com/deomusic/app
+          mkdir -p $PKG
+          cat > $PKG/MediaService.java <<'JAVA'
+          package com.deomusic.app;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Intent;
+          import android.content.pm.ServiceInfo;
+          import android.graphics.Bitmap;
+          import android.os.Build;
+          import android.os.IBinder;
+          import android.os.PowerManager;
+          import android.support.v4.media.MediaMetadataCompat;
+          import android.support.v4.media.session.MediaSessionCompat;
+          import android.support.v4.media.session.PlaybackStateCompat;
+          import androidx.core.app.NotificationCompat;
+          import androidx.media.app.NotificationCompat.MediaStyle;
+
+          /**
+           * Servicio de primer plano (mediaPlayback) + MediaSession nativa.
+           * El audio lo reproduce la pagina (un solo reproductor); este servicio mantiene viva
+           * la app y muestra la tarjeta multimedia en la notificacion y en la pantalla de bloqueo.
+           */
+          public class MediaService extends Service {
+              static final String CH = "deo_media";
+              static final int NID = 4711;
+              static final String A_UPD = "deo.UPD";
+              static final String A_STOP = "deo.STOP";
+              static final String A_PLAY = "deo.PLAY";
+              static final String A_PAUSE = "deo.PAUSE";
+              static final String A_NEXT = "deo.NEXT";
+              static final String A_PREV = "deo.PREV";
+
+              static volatile MediaService inst;
+              static volatile String title = "";
+              static volatile String artist = "";
+              static volatile String album = "";
+              static volatile String output = "";
+              static volatile long dur = 0;
+              static volatile long pos = 0;
+              static volatile boolean playing = false;
+              static volatile Bitmap cover = null;
+
+              private MediaSessionCompat ms;
+              private boolean fg = false;
+              private PowerManager.WakeLock wl;
+
+              @Override
+              public void onCreate() {
+                  super.onCreate();
+                  inst = this;
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      NotificationChannel c = new NotificationChannel(CH, "Reproduccion", NotificationManager.IMPORTANCE_LOW);
+                      c.setShowBadge(false);
+                      c.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+                      ((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).createNotificationChannel(c);
+                  }
+                  ms = new MediaSessionCompat(this, "DeoMusic");
+                  ms.setCallback(new MediaSessionCompat.Callback() {
+                      @Override public void onPlay() { DeoNativePlugin.emit("play", 0); }
+                      @Override public void onPause() { DeoNativePlugin.emit("pause", 0); }
+                      @Override public void onStop() { DeoNativePlugin.emit("pause", 0); }
+                      @Override public void onSkipToNext() { DeoNativePlugin.emit("next", 0); }
+                      @Override public void onSkipToPrevious() { DeoNativePlugin.emit("prev", 0); }
+                      @Override public void onSeekTo(long p) { DeoNativePlugin.emit("seek", p / 1000); }
+                  });
+                  ms.setActive(true);
+                  PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+                  wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "DeoMusic:play");
+                  wl.setReferenceCounted(false);
+              }
+
+              @Override
+              public int onStartCommand(Intent i, int flags, int startId) {
+                  String a = i == null ? null : i.getAction();
+                  if (A_STOP.equals(a)) { shutdown(); return START_NOT_STICKY; }
+                  if (A_PLAY.equals(a)) { DeoNativePlugin.emit("play", 0); return START_NOT_STICKY; }
+                  if (A_PAUSE.equals(a)) { DeoNativePlugin.emit("pause", 0); return START_NOT_STICKY; }
+                  if (A_NEXT.equals(a)) { DeoNativePlugin.emit("next", 0); return START_NOT_STICKY; }
+                  if (A_PREV.equals(a)) { DeoNativePlugin.emit("prev", 0); return START_NOT_STICKY; }
+                  apply();
+                  return START_NOT_STICKY;
+              }
+
+              private void apply() {
+                  Bitmap cv = cover;
+                  ms.setMetadata(new MediaMetadataCompat.Builder()
+                          .putString(MediaMetadataCompat.METADATA_KEY_TITLE, title)
+                          .putString(MediaMetadataCompat.METADATA_KEY_ARTIST, artist)
+                          .putString(MediaMetadataCompat.METADATA_KEY_ALBUM, album)
+                          .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, dur * 1000L)
+                          .putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, cv)
+                          .putBitmap(MediaMetadataCompat.METADATA_KEY_ART, cv)
+                          .build());
+                  long acts = PlaybackStateCompat.ACTION_PLAY | PlaybackStateCompat.ACTION_PAUSE
+                          | PlaybackStateCompat.ACTION_PLAY_PAUSE | PlaybackStateCompat.ACTION_SKIP_TO_NEXT
+                          | PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS | PlaybackStateCompat.ACTION_SEEK_TO
+                          | PlaybackStateCompat.ACTION_STOP;
+                  ms.setPlaybackState(new PlaybackStateCompat.Builder()
+                          .setActions(acts)
+                          .setState(playing ? PlaybackStateCompat.STATE_PLAYING : PlaybackStateCompat.STATE_PAUSED,
+                                  pos * 1000L, playing ? 1f : 0f)
+                          .build());
+
+                  Notification n = build(cv);
+                  NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+                  if (!fg) {
+                      startFg(n);
+                      fg = true;
+                  } else {
+                      nm.notify(NID, n);
+                  }
+                  if (playing) {
+                      if (!wl.isHeld()) wl.acquire(6 * 60 * 60 * 1000L);
+                  } else {
+                      if (wl.isHeld()) wl.release();
+                      if (Build.VERSION.SDK_INT >= 24) stopForeground(Service.STOP_FOREGROUND_DETACH);
+                      else stopForeground(false);
+                      fg = false;
+                      nm.notify(NID, n);
+                  }
+              }
+
+              private void startFg(Notification n) {
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(NID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK);
+                  } else {
+                      startForeground(NID, n);
+                  }
+              }
+
+              private Notification build(Bitmap cv) {
+                  Intent launch = getPackageManager().getLaunchIntentForPackage(getPackageName());
+                  PendingIntent open = PendingIntent.getActivity(this, 0, launch,
+                          PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+                  NotificationCompat.Builder b = new NotificationCompat.Builder(this, CH)
+                          .setSmallIcon(android.R.drawable.ic_media_play)
+                          .setContentTitle(title)
+                          .setContentText(artist)
+                          .setLargeIcon(cv)
+                          .setContentIntent(open)
+                          .setOnlyAlertOnce(true)
+                          .setShowWhen(false)
+                          .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                          .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
+                          .setOngoing(playing)
+                          .addAction(act(android.R.drawable.ic_media_previous, "Anterior", A_PREV))
+                          .addAction(playing
+                                  ? act(android.R.drawable.ic_media_pause, "Pausa", A_PAUSE)
+                                  : act(android.R.drawable.ic_media_play, "Reproducir", A_PLAY))
+                          .addAction(act(android.R.drawable.ic_media_next, "Siguiente", A_NEXT))
+                          .setStyle(new MediaStyle()
+                                  .setMediaSession(ms.getSessionToken())
+                                  .setShowActionsInCompactView(0, 1, 2));
+                  String o = output;
+                  if (o != null && o.length() > 0) b.setSubText(o);
+                  return b.build();
+              }
+
+              private NotificationCompat.Action act(int icon, String label, String action) {
+                  Intent i = new Intent(this, MediaService.class).setAction(action);
+                  PendingIntent pi = PendingIntent.getService(this, action.hashCode(), i,
+                          PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+                  return new NotificationCompat.Action(icon, label, pi);
+              }
+
+              private void shutdown() {
+                  try { if (wl != null && wl.isHeld()) wl.release(); } catch (Exception e) { }
+                  try { ms.setActive(false); ms.release(); } catch (Exception e) { }
+                  try { stopForeground(true); } catch (Exception e) { }
+                  fg = false;
+                  try { ((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).cancel(NID); } catch (Exception e) { }
+                  stopSelf();
+              }
+
+              @Override
+              public void onTaskRemoved(Intent rootIntent) {
+                  DeoNativePlugin.playing = false;
+                  playing = false;
+                  shutdown();
+                  super.onTaskRemoved(rootIntent);
+              }
+
+              @Override
+              public void onDestroy() {
+                  inst = null;
+                  try { if (wl != null && wl.isHeld()) wl.release(); } catch (Exception e) { }
+                  try { ms.release(); } catch (Exception e) { }
+                  super.onDestroy();
+              }
+
+              @Override
+              public IBinder onBind(Intent intent) { return null; }
+          }
+          JAVA
+          cat > $PKG/DeoNativePlugin.java <<'JAVA'
+          package com.deomusic.app;
+
+          import android.Manifest;
+          import android.bluetooth.BluetoothAdapter;
+          import android.bluetooth.BluetoothClass;
+          import android.bluetooth.BluetoothDevice;
+          import android.bluetooth.BluetoothManager;
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.IntentFilter;
+          import android.content.pm.PackageManager;
+          import android.graphics.Bitmap;
+          import android.graphics.BitmapFactory;
+          import android.media.AudioAttributes;
+          import android.media.AudioDeviceCallback;
+          import android.media.AudioDeviceInfo;
+          import android.media.AudioManager;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.util.Base64;
+          import androidx.core.app.ActivityCompat;
+          import androidx.core.content.ContextCompat;
+          import com.getcapacitor.JSArray;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import java.util.ArrayList;
+          import java.util.HashSet;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Set;
+
+          @CapacitorPlugin(name = "DeoNative")
+          public class DeoNativePlugin extends Plugin {
+              static final int REQ = 4242;
+              static DeoNativePlugin inst;
+              static volatile boolean playing = false;
+              static PluginCall permCall;
+
+              private BluetoothAdapter bt;
+              private AudioManager am;
+              private AudioDeviceCallback adc;
+              private final Handler ui = new Handler(Looper.getMainLooper());
+              private int metaVer = 0;
+
+              private final Runnable pushOut = new Runnable() {
+                  @Override public void run() { emitOutput(); }
+              };
+
+              private final BroadcastReceiver rx = new BroadcastReceiver() {
+                  @Override
+                  public void onReceive(Context c, Intent i) {
+                      String a = i.getAction();
+                      if (a == null) return;
+                      try {
+                          if (BluetoothDevice.ACTION_FOUND.equals(a)) {
+                              BluetoothDevice d = i.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+                              if (d == null) return;
+                              JSObject o = dev(d);
+                              o.put("rssi", (int) i.getShortExtra(BluetoothDevice.EXTRA_RSSI, (short) -100));
+                              notifyListeners("btFound", o);
+                          } else if (BluetoothAdapter.ACTION_DISCOVERY_STARTED.equals(a)) {
+                              JSObject o = new JSObject();
+                              o.put("scanning", true);
+                              notifyListeners("btScan", o);
+                          } else if (BluetoothAdapter.ACTION_DISCOVERY_FINISHED.equals(a)) {
+                              JSObject o = new JSObject();
+                              o.put("scanning", false);
+                              notifyListeners("btScan", o);
+                          } else if (BluetoothDevice.ACTION_BOND_STATE_CHANGED.equals(a)) {
+                              BluetoothDevice d = i.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+                              if (d == null) return;
+                              int s = i.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR);
+                              JSObject o = new JSObject();
+                              o.put("id", d.getAddress());
+                              o.put("state", s == BluetoothDevice.BOND_BONDED ? "bonded"
+                                      : s == BluetoothDevice.BOND_BONDING ? "bonding" : "none");
+                              notifyListeners("btBond", o);
+                              schedOut();
+                          } else if (BluetoothAdapter.ACTION_STATE_CHANGED.equals(a)) {
+                              int s = i.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1);
+                              JSObject o = new JSObject();
+                              o.put("on", s == BluetoothAdapter.STATE_ON);
+                              notifyListeners("btPower", o);
+                              schedOut();
+                          }
+                      } catch (SecurityException e) {
+                          // sin permiso: se ignora
+                      }
+                  }
+              };
+
+              @Override
+              public void load() {
+                  inst = this;
+                  Context c = getContext();
+                  am = (AudioManager) c.getSystemService(Context.AUDIO_SERVICE);
+                  BluetoothManager bm = (BluetoothManager) c.getSystemService(Context.BLUETOOTH_SERVICE);
+                  bt = bm == null ? null : bm.getAdapter();
+                  IntentFilter f = new IntentFilter();
+                  f.addAction(BluetoothDevice.ACTION_FOUND);
+                  f.addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED);
+                  f.addAction(BluetoothAdapter.ACTION_DISCOVERY_STARTED);
+                  f.addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED);
+                  f.addAction(BluetoothAdapter.ACTION_STATE_CHANGED);
+                  ContextCompat.registerReceiver(c, rx, f, ContextCompat.RECEIVER_NOT_EXPORTED);
+                  if (Build.VERSION.SDK_INT >= 23 && am != null) {
+                      adc = new AudioDeviceCallback() {
+                          @Override public void onAudioDevicesAdded(AudioDeviceInfo[] added) { schedOut(); }
+                          @Override public void onAudioDevicesRemoved(AudioDeviceInfo[] removed) { schedOut(); }
+                      };
+                      am.registerAudioDeviceCallback(adc, ui);
+                  }
+              }
+
+              @Override
+              protected void handleOnDestroy() {
+                  try { getContext().unregisterReceiver(rx); } catch (Exception e) { }
+                  try { if (adc != null && am != null) am.unregisterAudioDeviceCallback(adc); } catch (Exception e) { }
+                  try { if (bt != null && bt.isDiscovering()) bt.cancelDiscovery(); } catch (Exception e) { }
+                  inst = null;
+              }
+
+              /* ---------------- permisos ---------------- */
+
+              private boolean granted(String p) {
+                  return ContextCompat.checkSelfPermission(getContext(), p) == PackageManager.PERMISSION_GRANTED;
+              }
+
+              private boolean hasBt() {
+                  if (Build.VERSION.SDK_INT >= 31) {
+                      return granted(Manifest.permission.BLUETOOTH_CONNECT) && granted(Manifest.permission.BLUETOOTH_SCAN);
+                  }
+                  return granted(Manifest.permission.ACCESS_FINE_LOCATION);
+              }
+
+              static void permResult(int[] grants) {
+                  PluginCall c = permCall;
+                  permCall = null;
+                  if (c == null) return;
+                  boolean ok = grants != null && grants.length > 0;
+                  if (grants != null) {
+                      for (int g : grants) if (g != PackageManager.PERMISSION_GRANTED) ok = false;
+                  }
+                  JSObject o = new JSObject();
+                  o.put("granted", ok);
+                  c.resolve(o);
+              }
+
+              @PluginMethod
+              public void requestPerms(PluginCall call) {
+                  String kind = call.getString("kind", "bt");
+                  List<String> need = new ArrayList<>();
+                  if ("notif".equals(kind)) {
+                      if (Build.VERSION.SDK_INT >= 33 && !granted(Manifest.permission.POST_NOTIFICATIONS)) {
+                          need.add(Manifest.permission.POST_NOTIFICATIONS);
+                      }
+                  } else if (Build.VERSION.SDK_INT >= 31) {
+                      if (!granted(Manifest.permission.BLUETOOTH_CONNECT)) need.add(Manifest.permission.BLUETOOTH_CONNECT);
+                      if (!granted(Manifest.permission.BLUETOOTH_SCAN)) need.add(Manifest.permission.BLUETOOTH_SCAN);
+                  } else if (!granted(Manifest.permission.ACCESS_FINE_LOCATION)) {
+                      need.add(Manifest.permission.ACCESS_FINE_LOCATION);
+                  }
+                  if (need.isEmpty()) {
+                      JSObject o = new JSObject();
+                      o.put("granted", true);
+                      call.resolve(o);
+                      return;
+                  }
+                  permCall = call;
+                  ActivityCompat.requestPermissions(getActivity(), need.toArray(new String[0]), REQ);
+              }
+
+              @PluginMethod
+              public void getInfo(PluginCall call) {
+                  JSObject o = new JSObject();
+                  o.put("sdk", Build.VERSION.SDK_INT);
+                  o.put("btSupported", bt != null);
+                  o.put("btOn", bt != null && bt.isEnabled());
+                  o.put("perm", hasBt());
+                  call.resolve(o);
+              }
+
+              /* ---------------- tipo de dispositivo ---------------- */
+
+              private String typeOf(String name, BluetoothDevice d) {
+                  String n = name == null ? "" : name.toLowerCase(Locale.ROOT);
+                  if (n.contains("airpods") || n.contains("buds") || n.contains("earbud") || n.contains("pods")) return "earbuds";
+                  if (n.contains("echo") || n.contains("alexa")) return "alexa";
+                  if (n.contains("bravia") || n.contains("roku") || n.matches(".*\\btv\\b.*")) return "tv";
+                  try {
+                      BluetoothClass c = d == null ? null : d.getBluetoothClass();
+                      if (c != null) {
+                          switch (c.getDeviceClass()) {
+                              case BluetoothClass.Device.AUDIO_VIDEO_HEADPHONES:
+                              case BluetoothClass.Device.AUDIO_VIDEO_WEARABLE_HEADSET:
+                              case BluetoothClass.Device.AUDIO_VIDEO_HANDSFREE:
+                                  return "headphones";
+                              case BluetoothClass.Device.AUDIO_VIDEO_LOUDSPEAKER:
+                              case BluetoothClass.Device.AUDIO_VIDEO_PORTABLE_AUDIO:
+                              case BluetoothClass.Device.AUDIO_VIDEO_HIFI_AUDIO:
+                                  return "speaker";
+                              case BluetoothClass.Device.AUDIO_VIDEO_CAR_AUDIO:
+                                  return "car";
+                              case BluetoothClass.Device.AUDIO_VIDEO_VIDEO_DISPLAY_AND_LOUDSPEAKER:
+                              case BluetoothClass.Device.AUDIO_VIDEO_VIDEO_MONITOR:
+                              case BluetoothClass.Device.AUDIO_VIDEO_SET_TOP_BOX:
+                                  return "tv";
+                              default:
+                                  break;
+                          }
+                          int major = c.getMajorDeviceClass();
+                          if (major == BluetoothClass.Device.Major.AUDIO_VIDEO) return "speaker";
+                          if (major == BluetoothClass.Device.Major.PHONE) return "phone";
+                      }
+                  } catch (SecurityException e) {
+                      // sin permiso
+                  }
+                  return "unknown";
+              }
+
+              private boolean isAudioCandidate(BluetoothDevice d) {
+                  try {
+                      BluetoothClass c = d.getBluetoothClass();
+                      if (c == null) return true;
+                      int m = c.getMajorDeviceClass();
+                      return m != BluetoothClass.Device.Major.PERIPHERAL
+                              && m != BluetoothClass.Device.Major.HEALTH
+                              && m != BluetoothClass.Device.Major.IMAGING
+                              && m != BluetoothClass.Device.Major.TOY;
+                  } catch (SecurityException e) {
+                      return true;
+                  }
+              }
+
+              private static boolean isBtType(int t) {
+                  return t == 7 || t == 8 || t == 23 || t == 26 || t == 27 || t == 30;
+              }
+
+              private static boolean isA2dpType(int t) {
+                  return t == 8 || t == 23 || t == 26 || t == 27 || t == 30;
+              }
+
+              private Set<String> connectedAddrs() {
+                  Set<String> s = new HashSet<>();
+                  if (am == null || Build.VERSION.SDK_INT < 28) return s;
+                  for (AudioDeviceInfo d : am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+                      if (isBtType(d.getType())) {
+                          String a = d.getAddress();
+                          if (a != null && a.length() > 0) s.add(a.toUpperCase(Locale.ROOT));
+                      }
+                  }
+                  return s;
+              }
+
+              private JSObject dev(BluetoothDevice d) {
+                  JSObject o = new JSObject();
+                  String n = null;
+                  try { n = d.getName(); } catch (SecurityException e) { }
+                  o.put("id", d.getAddress());
+                  o.put("name", n == null ? "" : n);
+                  o.put("type", typeOf(n, d));
+                  o.put("bonded", d.getBondState() == BluetoothDevice.BOND_BONDED);
+                  o.put("audio", isAudioCandidate(d));
+                  o.put("connected", connectedAddrs().contains(d.getAddress().toUpperCase(Locale.ROOT)));
+                  return o;
+              }
+
+              private BluetoothDevice remote(String addr) {
+                  try {
+                      if (bt == null || addr == null) return null;
+                      return bt.getRemoteDevice(addr);
+                  } catch (Exception e) {
+                      return null;
+                  }
+              }
+
+              /* ---------------- Bluetooth: lista, busqueda, vinculacion ---------------- */
+
+              @PluginMethod
+              public void listBonded(PluginCall call) {
+                  if (bt == null) { call.reject("no_bt"); return; }
+                  if (!hasBt()) { call.reject("perm"); return; }
+                  try {
+                      JSArray arr = new JSArray();
+                      for (BluetoothDevice d : bt.getBondedDevices()) arr.put(dev(d));
+                      JSObject o = new JSObject();
+                      o.put("devices", arr);
+                      call.resolve(o);
+                  } catch (SecurityException e) {
+                      call.reject("perm");
+                  }
+              }
+
+              @PluginMethod
+              public void startScan(PluginCall call) {
+                  if (bt == null || !bt.isEnabled()) { call.reject("off"); return; }
+                  if (!hasBt()) { call.reject("perm"); return; }
+                  try {
+                      if (bt.isDiscovering()) bt.cancelDiscovery();
+                      boolean ok = bt.startDiscovery();
+                      JSObject o = new JSObject();
+                      o.put("started", ok);
+                      call.resolve(o);
+                  } catch (SecurityException e) {
+                      call.reject("perm");
+                  }
+              }
+
+              @PluginMethod
+              public void stopScan(PluginCall call) {
+                  try { if (bt != null && bt.isDiscovering()) bt.cancelDiscovery(); } catch (SecurityException e) { }
+                  call.resolve();
+              }
+
+              @PluginMethod
+              public void pair(PluginCall call) {
+                  BluetoothDevice d = remote(call.getString("id"));
+                  if (d == null) { call.reject("bad_id"); return; }
+                  if (!hasBt()) { call.reject("perm"); return; }
+                  try {
+                      JSObject o = new JSObject();
+                      if (d.getBondState() == BluetoothDevice.BOND_BONDED) {
+                          o.put("already", true);
+                      } else {
+                          if (bt.isDiscovering()) bt.cancelDiscovery();
+                          o.put("started", d.createBond());
+                      }
+                      call.resolve(o);
+                  } catch (SecurityException e) {
+                      call.reject("perm");
+                  }
+              }
+
+              /* ---------------- salida de audio real ---------------- */
+
+              private JSObject activeOutput() {
+                  AudioDeviceInfo pick = null;
+                  boolean conf = false;
+                  AudioDeviceInfo[] outs = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS);
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      try {
+                          List<AudioDeviceInfo> l = am.getAudioDevicesForAttributes(new AudioAttributes.Builder()
+                                  .setUsage(AudioAttributes.USAGE_MEDIA)
+                                  .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                                  .build());
+                          if (l != null && !l.isEmpty()) { pick = l.get(0); conf = true; }
+                      } catch (Exception e) { }
+                  }
+                  if (pick == null) {
+                      boolean a2 = false;
+                      try { a2 = am.isBluetoothA2dpOn(); } catch (Exception e) { }
+                      boolean wired = false;
+                      try { wired = am.isWiredHeadsetOn(); } catch (Exception e) { }
+                      if (a2) {
+                          for (AudioDeviceInfo d : outs) if (isA2dpType(d.getType())) { pick = d; conf = true; break; }
+                      }
+                      if (pick == null && wired) {
+                          for (AudioDeviceInfo d : outs) {
+                              int t = d.getType();
+                              if (t == 3 || t == 4 || t == 22) { pick = d; conf = true; break; }
+                          }
+                      }
+                      if (pick == null) {
+                          for (AudioDeviceInfo d : outs) {
+                              int t = d.getType();
+                              if (t == 9 || t == 10 || t == 29) { pick = d; conf = false; break; }
+                          }
+                      }
+                      if (pick == null) {
+                          for (AudioDeviceInfo d : outs) if (d.getType() == 2) { pick = d; conf = true; break; }
+                      }
+                  }
+                  JSObject o = new JSObject();
+                  if (pick == null) {
+                      o.put("kind", "phone");
+                      o.put("type", "phone");
+                      o.put("name", "Altavoz del teléfono");
+                      o.put("confirmed", false);
+                      return o;
+                  }
+                  int t = pick.getType();
+                  String kind;
+                  String type;
+                  String name = pick.getProductName() == null ? "" : pick.getProductName().toString();
+                  if (isBtType(t)) {
+                      kind = "bt";
+                      BluetoothDevice d = Build.VERSION.SDK_INT >= 28 ? remote(pick.getAddress()) : null;
+                      String n = null;
+                      if (d != null) { try { n = d.getName(); } catch (SecurityException e) { } }
+                      if (n != null && n.length() > 0) name = n;
+                      if (name.length() == 0) name = "Dispositivo Bluetooth";
+                      type = typeOf(name, d);
+                      if ("unknown".equals(type)) type = "bt";
+                      if (d != null) o.put("id", d.getAddress());
+                  } else if (t == 1) {
+                      kind = "phone"; type = "phone"; name = "Auricular del teléfono";
+                  } else if (t == 2) {
+                      kind = "phone"; type = "phone"; name = "Altavoz del teléfono";
+                  } else if (t == 3 || t == 4) {
+                      kind = "wired"; type = "headphones"; name = "Audífonos con cable";
+                  } else if (t == 22) {
+                      kind = "wired"; type = "headphones"; name = name.length() > 0 ? name : "Audífonos USB";
+                  } else if (t == 9 || t == 10 || t == 29) {
+                      kind = "tv"; type = "tv"; name = "Televisor (HDMI)";
+                  } else if (t == 11 || t == 12) {
+                      kind = "usb"; type = "speaker"; name = name.length() > 0 ? name : "Equipo USB";
+                  } else {
+                      kind = "other"; type = "speaker"; name = name.length() > 0 ? name : "Salida de audio";
+                  }
+                  o.put("kind", kind);
+                  o.put("type", type);
+                  o.put("name", name);
+                  o.put("confirmed", conf);
+                  return o;
+              }
+
+              private void schedOut() {
+                  ui.removeCallbacks(pushOut);
+                  ui.postDelayed(pushOut, 400);
+                  ui.postDelayed(pushOut, 1800);
+              }
+
+              private void emitOutput() {
+                  try {
+                      JSObject a = activeOutput();
+                      String nm = a.getString("name");
+                      MediaService.output = nm == null ? "" : nm;
+                      JSObject o = new JSObject();
+                      o.put("active", a);
+                      notifyListeners("output", o);
+                      if (MediaService.inst != null) push();
+                  } catch (Exception e) { }
+              }
+
+              @PluginMethod
+              public void getOutput(PluginCall call) {
+                  try {
+                      JSObject a = activeOutput();
+                      String nm = a.getString("name");
+                      MediaService.output = nm == null ? "" : nm;
+                      JSObject o = new JSObject();
+                      o.put("active", a);
+                      call.resolve(o);
+                  } catch (Exception e) {
+                      call.reject("out_fail");
+                  }
+              }
+
+              @PluginMethod
+              public void openOutputSwitcher(PluginCall call) {
+                  Context c = getContext();
+                  List<Intent> list = new ArrayList<>();
+                  list.add(new Intent("com.android.settings.panel.action.MEDIA_OUTPUT")
+                          .putExtra("com.android.settings.panel.extra.PACKAGE_NAME", c.getPackageName()));
+                  if (Build.VERSION.SDK_INT >= 29) list.add(new Intent("android.settings.panel.action.VOLUME"));
+                  list.add(new Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS));
+                  for (Intent i : list) {
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      try {
+                          c.startActivity(i);
+                          call.resolve();
+                          return;
+                      } catch (Exception e) { }
+                  }
+                  call.reject("no_panel");
+              }
+
+              @PluginMethod
+              public void openBtSettings(PluginCall call) {
+                  try {
+                      Intent i = new Intent(android.provider.Settings.ACTION_BLUETOOTH_SETTINGS);
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      getContext().startActivity(i);
+                      call.resolve();
+                  } catch (Exception e) {
+                      call.reject("no_settings");
+                  }
+              }
+
+              /* ---------------- tarjeta multimedia ---------------- */
+
+              private static String nz(String s) { return s == null ? "" : s; }
+
+              private void push() {
+                  Context c = getContext();
+                  try {
+                      Intent i = new Intent(c, MediaService.class).setAction(MediaService.A_UPD);
+                      if (MediaService.playing) {
+                          try {
+                              ContextCompat.startForegroundService(c, i);
+                          } catch (Exception e) {
+                              if (MediaService.inst != null) c.startService(i);
+                          }
+                      } else if (MediaService.inst != null) {
+                          c.startService(i);
+                      }
+                  } catch (Exception e) { }
+              }
+
+              @PluginMethod
+              public void setMeta(final PluginCall call) {
+                  MediaService.title = nz(call.getString("title"));
+                  MediaService.artist = nz(call.getString("artist"));
+                  MediaService.album = nz(call.getString("album"));
+                  Integer d = call.getInt("duration");
+                  MediaService.dur = d == null ? 0 : d;
+                  final String cv = call.getString("cover");
+                  final int ver = ++metaVer;
+                  if (cv == null || cv.length() == 0) {
+                      MediaService.cover = null;
+                      push();
+                      call.resolve();
+                      return;
+                  }
+                  new Thread(new Runnable() {
+                      @Override public void run() {
+                          Bitmap b = null;
+                          try {
+                              int k = cv.indexOf(',');
+                              byte[] by = Base64.decode(k >= 0 ? cv.substring(k + 1) : cv, Base64.DEFAULT);
+                              b = BitmapFactory.decodeByteArray(by, 0, by.length);
+                          } catch (Exception e) { }
+                          if (ver == metaVer) {
+                              MediaService.cover = b;
+                              ui.post(new Runnable() { @Override public void run() { push(); } });
+                          }
+                      }
+                  }).start();
+                  call.resolve();
+              }
+
+              @PluginMethod
+              public void setState(PluginCall call) {
+                  Boolean p = call.getBoolean("playing");
+                  Integer pos = call.getInt("pos");
+                  MediaService.playing = p != null && p;
+                  playing = MediaService.playing;
+                  MediaService.pos = pos == null ? 0 : pos;
+                  push();
+                  call.resolve();
+              }
+
+              @PluginMethod
+              public void stopMedia(PluginCall call) {
+                  playing = false;
+                  MediaService.playing = false;
+                  try {
+                      if (MediaService.inst != null) {
+                          Context c = getContext();
+                          c.startService(new Intent(c, MediaService.class).setAction(MediaService.A_STOP));
+                      }
+                  } catch (Exception e) { }
+                  call.resolve();
+              }
+
+              static void emit(String action, long pos) {
+                  DeoNativePlugin p = inst;
+                  if (p == null) return;
+                  JSObject o = new JSObject();
+                  o.put("action", action);
+                  o.put("pos", pos);
+                  p.notifyListeners("media", o);
+              }
+          }
+          JAVA
+          cat > $PKG/MainActivity.java <<'JAVA'
+          package com.deomusic.app;
+
+          import android.os.Bundle;
+          import android.webkit.WebView;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  registerPlugin(DeoNativePlugin.class);
+                  super.onCreate(savedInstanceState);
+                  try {
+                      WebView w = getBridge().getWebView();
+                      if (w != null) w.getSettings().setMediaPlaybackRequiresUserGesture(false);
+                  } catch (Exception e) { }
+              }
+
+              @Override
+              public void onPause() {
+                  super.onPause();
+                  keepAlive();
+              }
+
+              @Override
+              public void onStop() {
+                  super.onStop();
+                  keepAlive();
+              }
+
+              /** Evita que Android congele la pagina (y su audio) cuando se apaga la pantalla o se cambia de app. */
+              private void keepAlive() {
+                  try {
+                      if (!DeoNativePlugin.playing || getBridge() == null) return;
+                      WebView w = getBridge().getWebView();
+                      if (w == null) return;
+                      w.onResume();
+                      w.resumeTimers();
+                  } catch (Exception e) { }
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+                  if (requestCode == DeoNativePlugin.REQ) DeoNativePlugin.permResult(grantResults);
+              }
+          }
+          JAVA
+          python3 - <<'PY'
+
+          import re
+          p = "android/app/src/main/AndroidManifest.xml"
+          m = open(p, encoding="utf-8").read()
+          perms = [
+            ("android.permission.FOREGROUND_SERVICE", ""),
+            ("android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK", ""),
+            ("android.permission.POST_NOTIFICATIONS", ""),
+            ("android.permission.WAKE_LOCK", ""),
+            ("android.permission.BLUETOOTH", ' android:maxSdkVersion="30"'),
+            ("android.permission.BLUETOOTH_ADMIN", ' android:maxSdkVersion="30"'),
+            ("android.permission.BLUETOOTH_CONNECT", ""),
+            ("android.permission.BLUETOOTH_SCAN", ' android:usesPermissionFlags="neverForLocation"'),
+            ("android.permission.ACCESS_FINE_LOCATION", ' android:maxSdkVersion="30"'),
+            ("android.permission.ACCESS_COARSE_LOCATION", ' android:maxSdkVersion="30"'),
+          ]
+          add = ""
+          for name, extra in perms:
+              if name not in m:
+                  add += '    <uses-permission android:name="%s"%s />\n' % (name, extra)
+          assert "<application" in m and "</application>" in m
+          m = m.replace("<application", add + "    <application", 1)
+          svc = '        <service android:name="com.deomusic.app.MediaService" android:exported="false" android:foregroundServiceType="mediaPlayback" />\n    '
+          m = m.replace("</application>", svc + "</application>", 1)
+          open(p, "w", encoding="utf-8").write(m)
+          print(m)
+          PY
+          sed -i '0,/^dependencies {/s//dependencies {\n    implementation "androidx.media:media:1.7.0"/' android/app/build.gradle
+          grep -n 'androidx.media:media' android/app/build.gradle
 
       - name: Generate app icons
         run: |
