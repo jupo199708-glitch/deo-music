@@ -690,8 +690,8 @@ function diagLine() {
       else if (a === "seek") { st.pos = Math.max(0, e.pos | 0); dock(); }
     });
     NAT.getOutput().then(function (r) { BT.out = r.active; applyOut(); }).catch(function () {});
-    NM.k = ""; dock(); nPing();
-  } catch (x) { NAT = null; BT.perr = "inicio: " + x; }
+    setTimeout(function () { NM.k = ""; dock(); nPing(); }, 0);
+  } catch (x) { BT.perr = "inicio: " + x; }
 })();
 /* Perfil: agitar + almacenamiento */
 var SHN = ["", "Muy baja", "Baja", "Media", "Alta", "Muy alta"];
