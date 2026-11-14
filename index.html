@@ -149,7 +149,8 @@ button:active{transform:scale(.95)}
 .mrow.on{background:var(--btn)}.mrow span{flex:1;min-width:0}.mrow .i{width:24px;height:24px;flex:none}.mrow small{display:block;margin-top:2px;color:var(--muted);font-size:14px}
 .rt small.oc,.ft small.oc{display:flex;align-items:center;gap:5px;margin-top:3px;font-size:12px;color:var(--muted);font-weight:400}
 .ft small.oc{margin-top:6px;font-size:13px}
-.oc .i{width:14px;height:14px;flex:none}.oc em{display:block;font-style:normal;font-size:inherit;font-weight:inherit;line-height:normal;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.oc:empty{display:none!important}
+.oc .i{width:14px;height:14px;flex:none}.mrow .nm{display:block;font-style:normal;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.mrow.dv small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.oc em{display:block;font-style:normal;font-size:inherit;font-weight:inherit;line-height:normal;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.oc:empty{display:none!important}
 .mrow.bsy{opacity:.65;pointer-events:none}.sp{width:18px;height:18px;border:2px solid var(--line);border-top-color:var(--text);border-radius:50%;animation:spn .8s linear infinite;flex:none}
 @keyframes spn{to{transform:rotate(360deg)}}
 @media (prefers-reduced-motion:reduce){.sp{animation-duration:2s}}
@@ -583,10 +584,11 @@ function nClick(e) {
   if (e.target.closest("[data-btset]")) { NAT.openBtSettings(); return 1; }
   return 0;
 }
+function nm(n) { n = n || ""; return '<em class="nm">' + esc(!n || (n.length > 28 && n.indexOf(" ") < 0) ? "Dispositivo sin nombre" : n) + "</em>"; }
 function devsN() {
   var t = st.ct || "bt", now = Date.now(), h = '<h2>Conectar dispositivo</h2><div class="gtabs" role="tablist"><button data-ct="bt" aria-selected="' + (t === "bt") + '">Bluetooth</button><button data-ct="wf" aria-selected="' + (t === "wf") + '">Wi-Fi</button></div>';
   if (t === "wf") {
-    h += '<p class="pcount">Transmitir por Wi-Fi (Google Cast, DLNA, Alexa) todavía no está disponible: esos equipos no pueden recibir el audio de esta app. Si tienes un parlante Alexa/Echo, vincúlalo por Bluetooth en la otra pestaña y funciona como parlante Bluetooth.</p><button class="dev go" data-sw="1">Abrir selector de salida de Android</button>';
+    h += '<p class="pcount">Transmitir por Wi-Fi (Google Cast, DLNA, Alexa) todavía no está disponible: esos equipos no pueden recibir el audio de esta app. Si tienes un parlante Alexa/Echo, vincúlalo por Bluetooth en la otra pestaña y funciona como parlante Bluetooth.</p><button class="dev" data-sw="1">Abrir selector de salida de Android</button>';
   } else if (BT.sup === false) {
     h += '<p class="pcount">Este teléfono no tiene Bluetooth.</p>';
   } else if (!BT.ok) {
@@ -595,13 +597,13 @@ function devsN() {
     h += '<p class="pcount">El Bluetooth está apagado.</p><button class="dev go" data-btset="1">Activar Bluetooth</button>';
   } else {
     var o = BT.out;
-    if (o && o.confirmed !== false) h += '<p class="pcount">Sonando por</p><button class="mrow on" data-sw="1">' + ic(kIc(o.type || o.kind)) + '<span>' + esc(o.name) + '<small>' + (o.kind === "phone" ? "Altavoz del teléfono" : "Salida de audio activa") + '</small></span><b style="font-size:14px">Cambiar</b></button>';
+    if (o && o.confirmed !== false) h += '<p class="pcount">Sonando por</p><button class="mrow dv on" data-sw="1">' + ic(kIc(o.type || o.kind)) + '<span>' + nm(o.name) + '<small>' + (o.kind === "phone" ? "Altavoz del teléfono" : "Salida de audio activa") + '</small></span><b style="font-size:14px">Cambiar</b></button>';
     var bl = BT.bonded.filter(function (d) { return d.audio || d.connected; }).sort(function (a, b) { return (b.connected ? 1 : 0) - (a.connected ? 1 : 0) || (a.name || "").localeCompare(b.name || ""); });
     if (bl.length) {
       h += '<p class="pcount">Vinculados</p>';
       bl.forEach(function (d) {
         var bz = BT.busy[d.id] > now;
-        h += '<button class="mrow' + (d.connected ? " on" : "") + (bz ? " bsy" : "") + '" data-bd="' + esc(d.id) + '">' + ic(kIc(d.type)) + '<span>' + esc(d.name || "Dispositivo sin nombre") + '<small>' + (bz ? "Conectando…" : d.connected ? "Conectado · salida de audio" : "Vinculado · sin conexión") + '</small></span>' + (bz ? '<i class="sp"></i>' : '<b style="font-size:14px">' + (d.connected ? "Desconectar" : "Conectar") + '</b>') + '</button>';
+        h += '<button class="mrow dv' + (d.connected ? " on" : "") + (bz ? " bsy" : "") + '" data-bd="' + esc(d.id) + '">' + ic(kIc(d.type)) + '<span>' + nm(d.name) + '<small>' + (bz ? "Conectando…" : d.connected ? "Conectado · salida de audio" : "Vinculado · sin conexión") + '</small></span>' + (bz ? '<i class="sp"></i>' : '<b style="font-size:14px">' + (d.connected ? "Desconectar" : "Conectar") + '</b>') + '</button>';
       });
     }
     var fl = Object.keys(BT.found).map(function (k) { return BT.found[k]; }).filter(function (d) { return !d.bonded; }).sort(function (a, b) { return (b.rssi || -100) - (a.rssi || -100); });
@@ -609,14 +611,15 @@ function devsN() {
       h += '<p class="pcount">Disponibles cerca</p>';
       fl.forEach(function (d) {
         var bz = BT.busy[d.id] > now;
-        h += '<button class="mrow' + (bz ? " bsy" : "") + '" data-pair="' + esc(d.id) + '">' + ic(kIc(d.type)) + '<span>' + esc(d.name || "Dispositivo sin nombre") + '<small>' + (bz ? "Vinculando…" : "Toca para vincular") + '</small></span>' + (bz ? '<i class="sp"></i>' : '<b style="font-size:14px">Vincular</b>') + '</button>';
+        h += '<button class="mrow dv' + (bz ? " bsy" : "") + '" data-pair="' + esc(d.id) + '">' + ic(kIc(d.type)) + '<span>' + nm(d.name) + '<small>' + (bz ? "Vinculando…" : "Toca para vincular") + '</small></span>' + (bz ? '<i class="sp"></i>' : '<b style="font-size:14px">Vincular</b>') + '</button>';
       });
     }
     if (!bl.length && !fl.length) h += '<p class="pcount">' + (BT.sc ? "Buscando dispositivos…" : "Aún no hay dispositivos. Pon tu parlante o audífonos en modo de vinculación y toca Buscar.") + '</p>';
     else if (BT.sc) h += '<p class="pcount">Buscando más dispositivos…</p>';
     if (BT.err) h += '<p class="pcount">' + esc(BT.err) + '</p>';
-    h += '<button class="dev go" data-nscan="1">' + (BT.sc ? "Detener búsqueda" : "Buscar dispositivos") + '</button>';
+    h += '<button class="dev" data-nscan="1">' + (BT.sc ? "Detener búsqueda" : "Buscar dispositivos") + '</button>';
   }
+  h += '<button class="dev go" data-x="1">Listo</button>';
   $("devs").innerHTML = h + diagLine();
 }
 new MutationObserver(function () { if (!$("sheet").classList.contains("open") && BT.sc && NAT) { BT.sc = 0; try { NAT.stopScan(); } catch (x) {} } }).observe($("sheet"), { attributes: true, attributeFilter: ["class"] });
@@ -658,7 +661,7 @@ function diagLine() {
   var t = "Versión 2 · " + (NAT ? "módulo nativo: sí" : nat ? "módulo nativo: NO" : "navegador (sin módulo nativo)");
   if (BT.ping) t += " · notificaciones: " + (BT.ping.notif ? "permitidas" : "bloqueadas") + " · servicio: " + (BT.ping.service ? "activo" : "apagado") + (BT.ping.err ? " · error: " + BT.ping.err : "");
   if (BT.perr) t += " · fallo en " + BT.perr;
-  return '<p class="pcount" style="font-size:11px;opacity:.7;margin-top:12px">' + esc(t) + '</p>';
+  return '<p class="pcount" style="font-size:11px;opacity:.7;margin-top:12px">' + esc(t) + '</p><p class="pcount" style="font-size:12px;opacity:.85;margin-top:6px">Este producto pertece a Deojandry Inc. Producciones no intentes copiarlo Perr4!</p>';
 }
 (function nInit() {
   try {
