@@ -103,7 +103,7 @@ jobs:
                   super.onCreate();
                   inst = this;
                   if (Build.VERSION.SDK_INT >= 26) {
-                      NotificationChannel c = new NotificationChannel(CH, "Reproduccion", NotificationManager.IMPORTANCE_LOW);
+                      NotificationChannel c = new NotificationChannel(CH, "Reproducción", NotificationManager.IMPORTANCE_LOW);
                       c.setShowBadge(false);
                       c.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
                       ((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).createNotificationChannel(c);
@@ -131,7 +131,11 @@ jobs:
                   if (A_PAUSE.equals(a)) { DeoNativePlugin.emit("pause", 0); return START_NOT_STICKY; }
                   if (A_NEXT.equals(a)) { DeoNativePlugin.emit("next", 0); return START_NOT_STICKY; }
                   if (A_PREV.equals(a)) { DeoNativePlugin.emit("prev", 0); return START_NOT_STICKY; }
-                  apply();
+                  try {
+                      apply();
+                  } catch (Throwable t) {
+                      DeoNativePlugin.lastErr = "servicio: " + t;
+                  }
                   return START_NOT_STICKY;
               }
 
@@ -270,6 +274,7 @@ jobs:
           import android.os.Looper;
           import android.util.Base64;
           import androidx.core.app.ActivityCompat;
+          import androidx.core.app.NotificationManagerCompat;
           import androidx.core.content.ContextCompat;
           import com.getcapacitor.JSArray;
           import com.getcapacitor.JSObject;
@@ -289,6 +294,7 @@ jobs:
               static DeoNativePlugin inst;
               static volatile boolean playing = false;
               static PluginCall permCall;
+              static volatile String lastErr = "";
 
               private BluetoothAdapter bt;
               private AudioManager am;
@@ -748,7 +754,21 @@ jobs:
                       } else if (MediaService.inst != null) {
                           c.startService(i);
                       }
-                  } catch (Exception e) { }
+                  } catch (Throwable e) {
+                      lastErr = "inicio del servicio: " + e;
+                  }
+              }
+
+              @PluginMethod
+              public void ping(PluginCall call) {
+                  JSObject o = new JSObject();
+                  o.put("v", 2);
+                  o.put("sdk", Build.VERSION.SDK_INT);
+                  o.put("notif", NotificationManagerCompat.from(getContext()).areNotificationsEnabled());
+                  o.put("service", MediaService.inst != null);
+                  o.put("playing", playing);
+                  o.put("err", lastErr);
+                  call.resolve(o);
               }
 
               @PluginMethod
@@ -821,10 +841,18 @@ jobs:
           package com.deomusic.app;
 
           import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.view.View;
           import android.webkit.WebView;
           import com.getcapacitor.BridgeActivity;
 
           public class MainActivity extends BridgeActivity {
+              private final Handler h = new Handler(Looper.getMainLooper());
+              private final Runnable again = new Runnable() {
+                  @Override public void run() { keepNow(); }
+              };
+
               @Override
               public void onCreate(Bundle savedInstanceState) {
                   registerPlugin(DeoNativePlugin.class);
@@ -847,14 +875,21 @@ jobs:
                   keepAlive();
               }
 
-              /** Evita que Android congele la pagina (y su audio) cuando se apaga la pantalla o se cambia de app. */
+              /** Evita que Android congele la pagina (y su audio) con la pantalla apagada o en otra app. */
               private void keepAlive() {
+                  keepNow();
+                  h.postDelayed(again, 400);
+                  h.postDelayed(again, 2500);
+              }
+
+              private void keepNow() {
                   try {
                       if (!DeoNativePlugin.playing || getBridge() == null) return;
                       WebView w = getBridge().getWebView();
                       if (w == null) return;
                       w.onResume();
                       w.resumeTimers();
+                      w.dispatchWindowVisibilityChanged(View.VISIBLE);
                   } catch (Exception e) { }
               }
 
@@ -941,6 +976,12 @@ jobs:
 
       - name: Sync Android
         run: npx cap sync android
+
+      - name: Keep the same signing key between builds
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: deo-debug-keystore-v1
 
       - name: Compile APK
         working-directory: android
